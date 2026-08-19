@@ -270,6 +270,363 @@ jobs:
           cp wheelhouse/*.whl dist/
           "${auditwheel_bin}" show dist/*.whl
 
+      - name: Add CUDA runtime RUNPATHs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+
+          # ------------------------------------------------------------
+          # 1. Find the repaired wheel
+          # ------------------------------------------------------------
+          wheels=(dist/*.whl)
+
+          if (( ${#wheels[@]} != 1 )); then
+              echo "Expected exactly one wheel in dist/, found ${#wheels[@]}"
+              printf '  %s\n' "${wheels[@]}"
+              exit 1
+          fi
+
+          wheel="$(realpath "${wheels[0]}")"
+          echo "Processing wheel: $wheel"
+
+          # CUDA 13.2.1 -> 13
+          cuda_major="${CUDAVER%%.*}"
+
+          if [[ ! "$cuda_major" =~ ^[0-9]+$ ]]; then
+              echo "Failed to determine CUDA major version from CUDAVER=$CUDAVER"
+              exit 1
+          fi
+
+          echo "CUDA major version: $cuda_major"
+
+          # ------------------------------------------------------------
+          # 2. Unpack wheel
+          #
+          # wheel_root corresponds to site-packages after installation.
+          #
+          # For example:
+          #
+          # wheel_root/
+          # ├── llama_cpp/
+          # │   ├── _ctypes_extensions.py
+          # │   └── lib/
+          # │       ├── libllama.so
+          # │       ├── libggml.so
+          # │       └── libggml-cuda.so
+          # └── ...
+          #
+          # ------------------------------------------------------------
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          unpack_dir="$tmpdir/unpacked"
+          mkdir -p "$unpack_dir"
+
+          python -m wheel unpack "$wheel" -d "$unpack_dir"
+
+          wheel_roots=("$unpack_dir"/*)
+
+          if (( ${#wheel_roots[@]} != 1 )); then
+              echo "Expected exactly one unpacked wheel directory"
+              printf '  %s\n' "${wheel_roots[@]}"
+              exit 1
+          fi
+
+          wheel_root="$(realpath "${wheel_roots[0]}")"
+
+          echo "Wheel root: $wheel_root"
+
+          # ------------------------------------------------------------
+          # 3. CUDA runtime libraries supplied externally
+          #
+          # libcuda is intentionally NOT included here.
+          #
+          # libcuda.so comes from the NVIDIA kernel driver and should be
+          # resolved by the system dynamic loader rather than from a
+          # Python/Conda CUDA runtime package.
+          #
+          # The other CUDA libraries may be provided by either:
+          #
+          #   pip:
+          #     <site-packages>/nvidia/cu13/lib
+          #
+          #   conda:
+          #     <env>/lib
+          #
+          # ------------------------------------------------------------
+          cuda_runtime_regex='^(libcudart|libcublas|libcublasLt|libcusparse|libcusolver|libcurand|libnvrtc|libnvJitLink)\.so([.][0-9]+)*$'
+
+          patched_count=0
+
+          # ------------------------------------------------------------
+          # 4. Scan every ELF in the wheel
+          # ------------------------------------------------------------
+          while IFS= read -r -d '' elf; do
+
+              # Ignore non-ELF files even if their filename contains ".so".
+              if ! file -Lb "$elf" | grep -q '^ELF '; then
+                  continue
+              fi
+
+              echo
+              echo "============================================================"
+              echo "ELF: ${elf#$wheel_root/}"
+              echo "============================================================"
+
+              needed="$(patchelf --print-needed "$elf" 2>/dev/null || true)"
+
+              printf '%s\n' "$needed" | sed 's/^/  NEEDED: /'
+
+              # --------------------------------------------------------
+              # Check whether this ELF DIRECTLY depends on a CUDA runtime
+              # library.
+              #
+              # RUNPATH is not transitive, therefore the RUNPATH must be
+              # attached to the ELF that actually has:
+              #
+              #     DT_NEEDED libcublas.so.X
+              #
+              # rather than blindly patching only libllama.so.
+              # --------------------------------------------------------
+              if ! printf '%s\n' "$needed" | grep -Eq "$cuda_runtime_regex"; then
+                  echo "  No direct CUDA runtime dependency; leaving RUNPATH unchanged."
+                  continue
+              fi
+
+              elf_dir="$(dirname "$elf")"
+
+              # --------------------------------------------------------
+              # 5. Calculate paths relative to THIS ELF automatically
+              #
+              # wheel_root == site-packages
+              #
+              # Example for:
+              #
+              #   llama_cpp/lib/libggml-cuda.so
+              #
+              # elf_dir -> site-packages:
+              #
+              #   ../..
+              #
+              # Therefore:
+              #
+              # pip NVIDIA runtime:
+              #
+              #   $ORIGIN/../../nvidia/cu13/lib
+              #
+              # Conda runtime:
+              #
+              #   $ORIGIN/../../../..
+              #
+              # The calculation below also works if a CUDA-dependent ELF
+              # moves to another directory in a future llama.cpp version.
+              # --------------------------------------------------------
+              read -r pip_cuda_rel conda_cuda_rel < <(
+                  python - "$elf_dir" "$wheel_root" "$cuda_major" <<'PY'
+          import os
+          import sys
+
+          elf_dir = os.path.realpath(sys.argv[1])
+          wheel_root = os.path.realpath(sys.argv[2])
+          cuda_major = sys.argv[3]
+
+          # Relative path from the ELF directory to site-packages.
+          to_site_packages = os.path.relpath(wheel_root, elf_dir)
+
+          # pip package layout:
+          #
+          #   <site-packages>/nvidia/cu13/lib
+          #
+          pip_cuda = os.path.normpath(
+              os.path.join(
+                  to_site_packages,
+                  "nvidia",
+                  f"cu{cuda_major}",
+                  "lib",
+              )
+          )
+
+          # Conda layout:
+          #
+          #   <env>/lib/pythonX.Y/site-packages
+          #                   ^^^^^^^^^^^^^^^^^
+          #                   wheel_root
+          #
+          # From site-packages:
+          #
+          #   ../.. -> <env>/lib
+          #
+          conda_cuda = os.path.normpath(
+              os.path.join(
+                  to_site_packages,
+                  "..",
+                  "..",
+              )
+          )
+
+          print(pip_cuda, conda_cuda)
+          PY
+              )
+
+              pip_cuda_rpath="\$ORIGIN/${pip_cuda_rel}"
+              conda_cuda_rpath="\$ORIGIN/${conda_cuda_rel}"
+
+              echo "  pip CUDA RUNPATH:   $pip_cuda_rpath"
+              echo "  conda CUDA RUNPATH: $conda_cuda_rpath"
+
+              # --------------------------------------------------------
+              # 6. Preserve auditwheel-generated relative RUNPATH entries
+              #
+              # auditwheel may already have added something like:
+              #
+              #   $ORIGIN
+              #   $ORIGIN/../../llama_cpp_python.libs
+              #
+              # Keep those.
+              #
+              # Do NOT preserve absolute paths such as:
+              #
+              #   /home/runner/miniconda3/envs/llamacpp/lib
+              #
+              # because they are valid only on the CI builder.
+              # --------------------------------------------------------
+              old_rpath="$(patchelf --print-rpath "$elf" 2>/dev/null || true)"
+
+              echo "  Old RUNPATH: ${old_rpath:-<empty>}"
+
+              declare -a new_rpaths=()
+              declare -A seen_rpaths=()
+
+              add_rpath() {
+                  local path="$1"
+
+                  [[ -n "$path" ]] || return
+
+                  if [[ -z "${seen_rpaths[$path]+x}" ]]; then
+                      seen_rpaths["$path"]=1
+                      new_rpaths+=("$path")
+                  fi
+              }
+
+              if [[ -n "$old_rpath" ]]; then
+                  IFS=':' read -ra old_entries <<< "$old_rpath"
+
+                  for entry in "${old_entries[@]}"; do
+                      case "$entry" in
+                          '$ORIGIN'|'$ORIGIN/'*|'${ORIGIN}'|'${ORIGIN}/'*)
+                              add_rpath "$entry"
+                              ;;
+                          "")
+                              ;;
+                          *)
+                              echo "  Dropping non-portable RUNPATH entry: $entry"
+                              ;;
+                      esac
+                  done
+              fi
+
+              # Keep same-directory lookup available.
+              add_rpath '$ORIGIN'
+
+              # NVIDIA pip CUDA package:
+              #
+              #   site-packages/nvidia/cu<major>/lib
+              add_rpath "$pip_cuda_rpath"
+
+              # Conda CUDA runtime:
+              #
+              #   <env>/lib
+              add_rpath "$conda_cuda_rpath"
+
+              new_rpath="$(
+                  IFS=:
+                  echo "${new_rpaths[*]}"
+              )"
+
+              echo "  New RUNPATH: $new_rpath"
+
+              # patchelf normally writes DT_RUNPATH rather than legacy
+              # DT_RPATH, which is what we want here.
+              patchelf --set-rpath "$new_rpath" "$elf"
+
+              patched_count=$((patched_count + 1))
+
+              # Clear associative array before next ELF.
+              unset seen_rpaths
+              unset new_rpaths
+
+          done < <(find "$wheel_root" -type f -print0)
+
+          echo
+          echo "Patched CUDA-dependent ELF files: $patched_count"
+
+          if (( patched_count == 0 )); then
+              echo "ERROR: no ELF with a direct CUDA runtime dependency was found."
+              echo "This probably means the CUDA dependency layout changed."
+              exit 1
+          fi
+
+          # ------------------------------------------------------------
+          # 7. Verify the modified ELF files before packing
+          # ------------------------------------------------------------
+          echo
+          echo "================ ELF verification ================"
+
+          while IFS= read -r -d '' elf; do
+              if ! file -Lb "$elf" | grep -q '^ELF '; then
+                  continue
+              fi
+
+              needed="$(patchelf --print-needed "$elf" 2>/dev/null || true)"
+
+              if printf '%s\n' "$needed" | grep -Eq "$cuda_runtime_regex"; then
+                  echo
+                  echo "${elf#$wheel_root/}"
+
+                  echo "  CUDA dependencies:"
+                  printf '%s\n' "$needed" \
+                      | grep -E "$cuda_runtime_regex" \
+                      | sed 's/^/    /'
+
+                  echo "  RUNPATH:"
+                  patchelf --print-rpath "$elf" \
+                      | sed 's/^/    /'
+              fi
+          done < <(find "$wheel_root" -type f -print0)
+
+          # ------------------------------------------------------------
+          # 8. Remove original wheel and repack
+          #
+          # `wheel pack` regenerates RECORD hashes/sizes, which is
+          # required because the ELF binaries have been modified.
+          # ------------------------------------------------------------
+          rm -f "$wheel"
+
+          python -m wheel pack "$wheel_root" -d dist
+
+          final_wheels=(dist/*.whl)
+
+          if (( ${#final_wheels[@]} != 1 )); then
+              echo "Expected exactly one repacked wheel, found ${#final_wheels[@]}"
+              printf '  %s\n' "${final_wheels[@]}"
+              exit 1
+          fi
+
+          final_wheel="$(realpath "${final_wheels[0]}")"
+
+          echo
+          echo "Final wheel:"
+          echo "  $final_wheel"
+
+          # ------------------------------------------------------------
+          # 9. Final auditwheel inspection
+          # ------------------------------------------------------------
+          auditwheel_bin="${CONDA}/envs/llamacpp/bin/auditwheel"
+
+          "$auditwheel_bin" show "$final_wheel"
+
       - uses: softprops/action-gh-release@v3
         if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         with:
